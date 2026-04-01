@@ -71,4 +71,3 @@ stable-diffusion.cpp/build/bin/export-graph-ops -m <model_path> [-o output_file]
 - The exported output is designed to support OP-level testing workflows.
 - A typical use case is generating operator samples from `stable-diffusion.cpp` and then testing those operators with the backend test utility from `llama.cpp`.
 
-## License
