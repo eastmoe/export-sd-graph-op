@@ -604,10 +604,12 @@ static WanInputs make_wan_inputs(WAN::WanRunner& model,
                                  const std::map<std::string, ggml_tensor*>& tensors) {
     WanInputs inputs;
 
-    const int64_t width           = 16;
-    const int64_t height          = 16;
-    const int64_t time            = 3;
-    const int64_t latent_channels = model.wan_params.out_dim;
+    const int64_t width  = 16;
+    const int64_t height = 16;
+    const int64_t time   = 3;
+
+    const int64_t latent_channels = model.wan_params.out_dim;  // 例如 16
+    const int64_t extra_channels  = std::max<int64_t>(0, model.wan_params.in_dim - latent_channels);
 
     inputs.x = sd::Tensor<float>({width, height, time, latent_channels, 1});
     inputs.x.fill_(0.0f);
@@ -619,26 +621,36 @@ static WanInputs make_wan_inputs(WAN::WanRunner& model,
     inputs.context = sd::Tensor<float>({model.wan_params.text_dim, model.wan_params.text_len, 1});
     inputs.context.fill_(0.0f);
 
-    // 只有当权重里真的带有图像嵌入相关参数时，才构造对应输入。
+    // c_concat 是否需要，取决于 patch embedding 期望的总输入通道数，而不是 img_emb 是否存在
+    if (extra_channels > 0) {
+        inputs.c_concat = sd::Tensor<float>({width, height, time, extra_channels, 1});
+        inputs.c_concat.fill_(0.0f);
+    }
+
+    // clip_fea 仍然按原逻辑单独处理
     const bool has_img_emb = has_tensor_suffix(tensors, "img_emb.proj.0.weight") ||
                              has_tensor_suffix(tensors, "img_emb.proj.1.weight") ||
                              has_tensor_suffix(tensors, "img_emb.emb_pos");
     if (has_img_emb) {
-        const int64_t clip_tokens = model.wan_params.flf_pos_embed_token_number > 0 ? model.wan_params.flf_pos_embed_token_number : 257;
-        inputs.clip_fea           = sd::Tensor<float>({1280, clip_tokens, 1});
+        const int64_t clip_tokens =
+            model.wan_params.flf_pos_embed_token_number > 0 ? model.wan_params.flf_pos_embed_token_number : 257;
+        inputs.clip_fea = sd::Tensor<float>({1280, clip_tokens, 1});
         inputs.clip_fea.fill_(0.0f);
-
-        // Wan2.1 I2V / FLF2V use clip_fea + c_concat. Wan2.2 I2V only needs clip_fea.
-        if (model.get_desc() != "Wan2.2-I2V-14B") {
-            const int64_t concat_channels = 4 + model.wan_params.out_dim;
-            inputs.c_concat               = sd::Tensor<float>({width, height, time, concat_channels, 1});
-            inputs.c_concat.fill_(0.0f);
-        }
     }
 
     if (model.wan_params.vace_layers > 0) {
         inputs.vace_context = sd::Tensor<float>({width, height, time, model.wan_params.vace_in_dim, 1});
         inputs.vace_context.fill_(0.0f);
+    }
+
+    const int64_t supplied_channels =
+        latent_channels + (inputs.c_concat.empty() ? 0 : inputs.c_concat.shape()[3]);
+
+    if (supplied_channels != model.wan_params.in_dim) {
+        throw std::runtime_error(
+            "Wan export input channel mismatch: patch_embedding expects " +
+            std::to_string(model.wan_params.in_dim) +
+            ", exporter supplies " + std::to_string(supplied_channels));
     }
 
     return inputs;
