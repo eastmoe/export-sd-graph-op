@@ -442,11 +442,23 @@ struct FluxInputs {
 
 // 为 Flux / Flux2 家族构造占位输入。
 static FluxInputs make_flux_inputs(SDVersion version, const std::map<std::string, ggml_tensor*>& tensors) {
-    int64_t in_channels = 64;
+    int64_t latent_channels = 16;
+
     if (const ggml_tensor* t = find_tensor_suffix(tensors, "img_in_patch.weight")) {
-        in_channels = t->ne[2];
+        latent_channels = t->ne[2];
     } else if (const ggml_tensor* t = find_tensor_suffix(tensors, "img_in.weight")) {
-        in_channels = t->ne[0];
+        int patch_size = sd_version_is_flux2(version) ? 1 : 2;
+        if (version == VERSION_OVIS_IMAGE) {
+            patch_size = 2;
+        }
+        const int64_t patchified_dim = t->ne[0];
+        if (patchified_dim % (patch_size * patch_size) != 0) {
+            throw std::runtime_error(
+                "Flux export input channel mismatch: img_in.weight input dim " +
+                std::to_string(patchified_dim) +
+                " is not divisible by patch_size^2=" + std::to_string(patch_size * patch_size));
+        }
+        latent_channels = patchified_dim / (patch_size * patch_size);
     }
 
     int64_t context_dim = 4096;
@@ -460,10 +472,9 @@ static FluxInputs make_flux_inputs(SDVersion version, const std::map<std::string
     }
 
     FluxInputs inputs;
-    inputs.x = sd::Tensor<float>({16, 16, in_channels, 1});
+    inputs.x = sd::Tensor<float>({16, 16, latent_channels, 1});
     inputs.x.fill_(0.0f);
 
-    // Flux 分支常用不同的时间步标度，这里给一个简单占位值。
     std::vector<float> timestep_vec(1, 1.0f);
     inputs.timesteps = sd::Tensor<float>::from_vector(timestep_vec);
 
@@ -476,7 +487,6 @@ static FluxInputs make_flux_inputs(SDVersion version, const std::map<std::string
     }
 
     std::vector<float> guidance_vec(1, 0.0f);
-    // Chroma Radiance 需要显式 guidance 占位值。
     if (version == VERSION_CHROMA_RADIANCE) {
         guidance_vec[0] = 1.0f;
     }
@@ -487,16 +497,28 @@ static FluxInputs make_flux_inputs(SDVersion version, const std::map<std::string
 
 // Qwen Image 构图所需的占位输入集合。
 struct QwenImageInputs {
-    sd::Tensor<float> x;          // 图像潜变量输入。
-    sd::Tensor<float> timesteps;  // 时间步。
-    sd::Tensor<float> context;    // 文本上下文。
+    sd::Tensor<float> x;
+    sd::Tensor<float> timesteps;
+    sd::Tensor<float> context;
+    std::vector<sd::Tensor<float>> ref_latents;
+    bool increase_ref_index = false;
 };
 
 // 为 Qwen Image 家族构造占位输入。
-static QwenImageInputs make_qwen_image_inputs(const std::map<std::string, ggml_tensor*>& tensors) {
-    int64_t in_channels = 64;
+static QwenImageInputs make_qwen_image_inputs(const std::map<std::string, ggml_tensor*>& tensors,
+                                              bool with_ref_latent = false) {
+    const int64_t patch_size = 2;
+
+    int64_t latent_channels = 16;
     if (const ggml_tensor* t = find_tensor_suffix(tensors, "img_in.weight")) {
-        in_channels = t->ne[0];
+        const int64_t patchified_dim = t->ne[0];
+        if (patchified_dim % (patch_size * patch_size) != 0) {
+            throw std::runtime_error(
+                "Qwen Image export input channel mismatch: img_in.weight input dim " +
+                std::to_string(patchified_dim) +
+                " is not divisible by patch_size^2=" + std::to_string(patch_size * patch_size));
+        }
+        latent_channels = patchified_dim / (patch_size * patch_size);
     }
 
     int64_t context_dim = 3584;
@@ -505,7 +527,7 @@ static QwenImageInputs make_qwen_image_inputs(const std::map<std::string, ggml_t
     }
 
     QwenImageInputs inputs;
-    inputs.x = sd::Tensor<float>({16, 16, in_channels, 1});
+    inputs.x = sd::Tensor<float>({16, 16, latent_channels, 1});
     inputs.x.fill_(0.0f);
 
     std::vector<float> timestep_vec(1, 1000.0f);
@@ -513,6 +535,13 @@ static QwenImageInputs make_qwen_image_inputs(const std::map<std::string, ggml_t
 
     inputs.context = sd::Tensor<float>({context_dim, 256, 1});
     inputs.context.fill_(0.0f);
+
+    if (with_ref_latent) {
+        sd::Tensor<float> ref = sd::Tensor<float>({16, 16, latent_channels, 1});
+        ref.fill_(0.0f);
+        inputs.ref_latents.push_back(std::move(ref));
+        inputs.increase_ref_index = true;
+    }
 
     return inputs;
 }
@@ -927,7 +956,41 @@ static void export_diffusion_stage(const char* model_path,
 
     // Qwen Image：使用专门的 QwenImageModel。
     if (sd_version_is_qwen_image(version)) {
-        QwenImageModel model(backend, false, tensor_storage_map, "model.diffusion_model", version, false);
+        // 对 qwen-image-edit 等模型，先从“模型发现用”的张量表里剥掉内部 marker，
+        // 避免 build_graph() 误走 edit / zero_cond_t 的高风险分支。
+        String2TensorStorage export_tensor_storage_map = tensor_storage_map;
+        bool stripped_internal_markers                 = false;
+
+        for (auto it = export_tensor_storage_map.begin(); it != export_tensor_storage_map.end();) {
+            const std::string& name = it->first;
+
+            const bool is_internal_marker =
+                name.find("model.diffusion_model.__x0__") != std::string::npos ||
+                name.find("model.diffusion_model.__32x32__") != std::string::npos ||
+                name.find("model.diffusion_model.__index_timestep_zero__") != std::string::npos;
+
+            if (is_internal_marker) {
+                it                        = export_tensor_storage_map.erase(it);
+                stripped_internal_markers = true;
+            } else {
+                ++it;
+            }
+        }
+
+        if (stripped_internal_markers) {
+            fprintf(stdout,
+                    "export-graph-ops: Qwen Image internal marker tensors detected; "
+                    "stripping exporter-only markers "
+                    "(__x0__/__32x32__/__index_timestep_zero__) "
+                    "to avoid edit-specific graph-build crashes\n");
+        }
+
+        QwenImageModel model(backend,
+                             false,
+                             export_tensor_storage_map,
+                             "model.diffusion_model",
+                             version,
+                             false);
         if (!load_model_tensors(model_loader, model, tensors)) {
             throw std::runtime_error("failed to load diffusion tensors");
         }
@@ -938,10 +1001,16 @@ static void export_diffusion_stage(const char* model_path,
         print_key_dimensions(tensors, version);
         fprintf(stdout, "\nexport-graph-ops: model type: %s\n", model_type.c_str());
 
-        QwenImageInputs inputs = make_qwen_image_inputs(tensors);
-        const std::vector<sd::Tensor<float>> empty_ref_latents;
+        // zero_cond_t 只需要 modulate_index，不需要为了导图伪造 ref latent。
+        // 伪造 ref latent 会额外走 edit/reference token 路径，当前这里容易构出坏张量。
+        QwenImageInputs inputs = make_qwen_image_inputs(tensors, false);
+
         model.qwen_image.reset_compute_ctx();
-        ggml_cgraph* gf = model.qwen_image.build_graph(inputs.x, inputs.timesteps, inputs.context, empty_ref_latents, false);
+        ggml_cgraph* gf = model.qwen_image.build_graph(
+            inputs.x,
+            inputs.timesteps,
+            inputs.context);
+
         extract_graph_ops(gf, model_type.c_str(), tests);
         return;
     }
@@ -1230,6 +1299,40 @@ static bool export_text_stage(const char* model_path,
 
     fprintf(stdout, "export-graph-ops: text stage skipped: unsupported text encoder family for version %s\n", version_desc(version));
     return false;
+}
+
+// exporter 侧用一个“去掉内部 marker”的张量表来做模型发现。
+// 原因：qwen-image-edit 等模型会带一些只用于运行时控制/标记的内部张量，
+// 例如 __index_timestep_zero__。正式推理加载时这些本来也会被忽略；
+// 但 exporter 如果直接拿原始 tensor_storage_map 去构造模型，容易走进
+// zero_cond_t / edit 专用路径，并在 build_graph() 期间触发坏张量。
+static String2TensorStorage make_export_tensor_storage_without_internal_markers(
+    const String2TensorStorage& tensor_storage_map,
+    bool* removed_any = nullptr) {
+    String2TensorStorage sanitized = tensor_storage_map;
+    bool removed                   = false;
+
+    for (auto it = sanitized.begin(); it != sanitized.end();) {
+        const std::string& name = it->first;
+
+        const bool is_internal_export_marker =
+            name.find("model.diffusion_model.__x0__") != std::string::npos ||
+            name.find("model.diffusion_model.__32x32__") != std::string::npos ||
+            name.find("model.diffusion_model.__index_timestep_zero__") != std::string::npos;
+
+        if (is_internal_export_marker) {
+            it      = sanitized.erase(it);
+            removed = true;
+        } else {
+            ++it;
+        }
+    }
+
+    if (removed_any != nullptr) {
+        *removed_any = removed;
+    }
+
+    return sanitized;
 }
 
 // 图像 VAE 编码/解码所需的占位输入集合。
