@@ -864,6 +864,42 @@ static void log_component_loaded(const std::string& label, size_t tensor_count) 
     fprintf(stdout, "export-graph-ops: component '%s' tensors: %zu\n", label.c_str(), tensor_count);
 }
 
+// 对 merged checkpoint，单独只看 "model.diffusion_model." 前缀时，
+// get_sd_version() 可能退化成 VERSION_COUNT。
+// 这里补一个“完整模型级别”的版本探测，逻辑与 stable-diffusion.cpp 更接近。
+static SDVersion detect_full_model_version(const char* model_path) {
+    ModelLoader version_loader;
+    if (!version_loader.init_from_file(model_path)) {
+        return VERSION_COUNT;
+    }
+
+    version_loader.convert_tensors_name();
+    return version_loader.get_sd_version();
+}
+
+// diffusion-only 版本识别失败时，回退到完整模型识别。
+static SDVersion resolve_diffusion_stage_version(const char* model_path,
+                                                 ModelLoader& diffusion_loader) {
+    SDVersion version = diffusion_loader.get_sd_version();
+    if (version != VERSION_COUNT) {
+        return version;
+    }
+
+    SDVersion full_version = detect_full_model_version(model_path);
+    if (full_version != VERSION_COUNT) {
+        fprintf(stdout,
+                "export-graph-ops: diffusion-only version detection returned VERSION_COUNT; "
+                "fallback to full-model detection => %d (%s)\n",
+                (int)full_version,
+                version_desc(full_version));
+        return full_version;
+    }
+
+    return VERSION_COUNT;
+}
+
+
+
 // 导出扩散主干阶段的算子。
 // 根据版本分发到 UNet / MMDiT / Flux / Qwen / Anima / Z-Image / Wan 等不同实现。
 static void export_diffusion_stage(const char* model_path,
@@ -875,9 +911,14 @@ static void export_diffusion_stage(const char* model_path,
     }
 
     auto& tensor_storage_map = model_loader.get_tensor_storage_map();
-    SDVersion version        = model_loader.get_sd_version();
+    SDVersion version        = resolve_diffusion_stage_version(model_path, model_loader);
 
     fprintf(stdout, "export-graph-ops: diffusion stage model version = %d (%s)\n", (int)version, version_desc(version));
+
+    if (version == VERSION_COUNT) {
+        throw std::runtime_error(
+            "unsupported diffusion model version: unable to infer version from diffusion-only tensors or full model");
+    }
 
     std::map<std::string, ggml_tensor*> tensors;
     std::string model_type;
@@ -896,9 +937,7 @@ static void export_diffusion_stage(const char* model_path,
         fprintf(stdout, "\nexport-graph-ops: model type: %s\n", model_type.c_str());
 
         UnetInputs inputs = make_unet_inputs(version, tensors);
-        // reset_compute_ctx() 是为了确保本次 build_graph 使用干净的计算上下文。
         model.unet.reset_compute_ctx();
-        // build_graph() 只搭图，不执行推理。
         ggml_cgraph* gf = model.unet.build_graph(inputs.x, inputs.timesteps, inputs.context, inputs.c_concat, inputs.y);
         extract_graph_ops(gf, model_type.c_str(), tests);
         return;
@@ -956,8 +995,6 @@ static void export_diffusion_stage(const char* model_path,
 
     // Qwen Image：使用专门的 QwenImageModel。
     if (sd_version_is_qwen_image(version)) {
-        // 对 qwen-image-edit 等模型，先从“模型发现用”的张量表里剥掉内部 marker，
-        // 避免 build_graph() 误走 edit / zero_cond_t 的高风险分支。
         String2TensorStorage export_tensor_storage_map = tensor_storage_map;
         bool stripped_internal_markers                 = false;
 
@@ -1001,8 +1038,6 @@ static void export_diffusion_stage(const char* model_path,
         print_key_dimensions(tensors, version);
         fprintf(stdout, "\nexport-graph-ops: model type: %s\n", model_type.c_str());
 
-        // zero_cond_t 只需要 modulate_index，不需要为了导图伪造 ref latent。
-        // 伪造 ref latent 会额外走 edit/reference token 路径，当前这里容易构出坏张量。
         QwenImageInputs inputs = make_qwen_image_inputs(tensors, false);
 
         model.qwen_image.reset_compute_ctx();
